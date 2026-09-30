@@ -1,7 +1,6 @@
-# ComplianceIQ v3 — Production-grade RAG system for EU cybersecurity regulations.
-# Supports NIS2 Directive (2022/2555) and GDPR (2016/679).
+# ComplianceIQ answers compliance questions on the NIS2 Directive 2022/2555 and the GDPR 2016/679
+# it retrieves the relevant Articles from the official PDFs and asks an LLM to answer with citations
 
-# IMPORTS
 from __future__ import annotations
 
 import os
@@ -16,7 +15,7 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # python-dotenv optional
+    pass  # python-dotenv is optional
 
 from langchain_groq import ChatGroq
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -28,7 +27,7 @@ from langchain_core.documents import Document
 from langchain_core.messages import SystemMessage, HumanMessage
 import gradio as gr
 
-# CONFIGURATION
+# paths, models and retrieval settings
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 if GROQ_API_KEY:
     os.environ["GROQ_API_KEY"] = GROQ_API_KEY
@@ -55,7 +54,7 @@ REG_GDPR: str = "GDPR"
 
 APP_VERSION: str = "3.0"
 
-# LOGGING
+# logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -63,7 +62,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("complianceiq")
 
-# OCR CLEANUP
+# words that the PDF text extraction splits in two and their correct form
 _OCR_FIXES: List[Tuple[str, str]] = [
     (r"\bAr\s+ticle\b",                    "Article"),
     (r"\bCHA\s*PTER\b",                    "CHAPTER"),
@@ -94,7 +93,7 @@ _OCR_FIXES: List[Tuple[str, str]] = [
     (r"\bMem\s+ber\s+Stat\s*es?\b",      "Member States"),
     (r"\bdir\s+ect\s+ive\b",             "Directive"),
     (r"\breg\s+ul\s+ation\b",            "Regulation"),
-    # Strip lone hyphenation artefacts: "cyber- security"
+    # join words broken by a hyphen at a line end such as cyber- security
     (r"(\w)-\s+(\w)",                     r"\1\2"),
 ]
 
@@ -102,13 +101,13 @@ _OCR_COMPILED = [(re.compile(p, re.IGNORECASE), r) for p, r in _OCR_FIXES]
 
 
 def clean_ocr(text: str) -> str:
-    """Apply all OCR fix patterns to text from a PDF page."""
+    # apply every OCR fix to the text of a PDF page
     for pattern, replacement in _OCR_COMPILED:
         text = pattern.sub(replacement, text)
     return text
 
 
-# REGEX PATTERNS
+# patterns for Articles, chapters, paragraphs and the tags the LLM adds to its answer
 ARTICLE_RE = re.compile(
     r"Article\s+(\d+)\s*\n\s*(.+?)\s*\n",
     re.MULTILINE,
@@ -123,7 +122,7 @@ GDPR_QUERY_RE  = re.compile(r"\bgdpr\b",    re.IGNORECASE)
 SUGGEST_RE     = re.compile(r"<!--\s*SUGGEST:\s*(.*?)\s*-->", re.DOTALL)
 CONFIDENCE_RE  = re.compile(r"\*\*Confidence:\s*(HIGH|PARTIAL|LOW)\*\*", re.IGNORECASE)
 
-# LEGAL SYNONYM ENRICHMENT
+# extra keywords for a chunk whose title matches a legal term
 _LEGAL_SYNONYM_PATTERNS: List[Tuple[str, str]] = [
     (r"fines?",                      "penalties sanctions enforcement"),
     (r"penalties|sanctions",         "fines administrative enforcement"),
@@ -140,12 +139,12 @@ _LEGAL_SYNONYM_PATTERNS: List[Tuple[str, str]] = [
 
 
 def _normalize_ocr(text: str) -> str:
-    """Collapse single inter-letter OCR spaces: 'f ines' → 'fines'."""
+    # remove the stray spaces OCR leaves inside words so that f ines becomes fines
     return re.sub(r"(?<=[A-Za-z]) (?=[A-Za-z])", "", text)
 
 
 def _derive_keywords(article_title: str, chapter_title: str) -> str:
-    """Return supplementary keywords for BM25/embedding enrichment."""
+    # synonyms that help BM25 and the embeddings find the Article
     normalised = _normalize_ocr(article_title + " " + chapter_title).lower()
     seen: set = set()
     extras: List[str] = []
@@ -158,11 +157,11 @@ def _derive_keywords(article_title: str, chapter_title: str) -> str:
     return " ".join(extras)
 
 
-# DOCUMENT LOADING
+# PDF loading
 def load_documents(docs_dir: str = DOCS_DIR) -> Dict[str, List[Document]]:
-    """Load all PDFs, apply OCR cleanup to every page, return {filename: pages}."""
+    # load every PDF in the folder and clean each page, keyed by file name
     if not os.path.isdir(docs_dir):
-        raise FileNotFoundError(f"Docs directory not found: {docs_dir}")
+        raise FileNotFoundError(f"Docs directory {docs_dir} not found")
     result: Dict[str, List[Document]] = {}
     for filename in sorted(os.listdir(docs_dir)):
         if not filename.lower().endswith(".pdf"):
@@ -173,7 +172,7 @@ def load_documents(docs_dir: str = DOCS_DIR) -> Dict[str, List[Document]]:
             page.page_content = clean_ocr(page.page_content)
             page.metadata["source"] = filename
         result[filename] = pages
-        logger.info("Loaded %s — %d pages", filename, len(pages))
+        logger.info("Loaded %s with %d pages", filename, len(pages))
     if not result:
         raise RuntimeError(f"No PDFs found in {docs_dir}")
     return result
@@ -189,7 +188,7 @@ def _regulation_for(filename: str) -> str:
 
 
 
-# ARTICLE-AWARE CHUNKING
+# chunking that follows the Article structure of each regulation
 def _page_at(pos: int, page_index: List[Tuple[int, int]]) -> int:
     page_num = page_index[0][1]
     for offset, num in page_index:
@@ -235,15 +234,11 @@ def _split_long_article(body: str, max_size: int = CHUNK_SIZE_MAX) -> List[str]:
 
 
 def chunk_documents(docs_by_file: Dict[str, List[Document]]) -> List[Document]:
-    """
-    Article-aware chunking. Each Document = one Article (or paragraph group).
-    Header format: [REGULATION: X | CHAPTER: Y | ARTICLE: N | TITLE: T]
-    Synonym keywords appended to header for better BM25/semantic coverage.
-    """
+    # one Document per Article or paragraph group with a header naming regulation, chapter, Article, title and synonym keywords
     all_chunks: List[Document] = []
     for filename, pages in docs_by_file.items():
         regulation = _regulation_for(filename)
-        logger.info("Chunking %s (%s)…", filename, regulation)
+        logger.info("Chunking %s (%s)", filename, regulation)
         page_index: List[Tuple[int, int]] = []
         combined = ""
         for page in pages:
@@ -255,7 +250,7 @@ def chunk_documents(docs_by_file: Dict[str, List[Document]]) -> List[Document]:
             for m in CHAPTER_RE.finditer(combined)
         ]
         article_matches = list(ARTICLE_RE.finditer(combined))
-        logger.info("  articles found: %d, chapters: %d", len(article_matches), len(chapters))
+        logger.info("  %d articles and %d chapters found", len(article_matches), len(chapters))
 
         for idx, match in enumerate(article_matches):
             art_num   = int(match.group(1))
@@ -297,18 +292,18 @@ def chunk_documents(docs_by_file: Dict[str, List[Document]]) -> List[Document]:
                         "total_chunks":  len(parts),
                     },
                 ))
-        logger.info("  → %d total chunks after %s", len(all_chunks), filename)
-    logger.info("Grand total: %d chunks", len(all_chunks))
+        logger.info("  %d total chunks after %s", len(all_chunks), filename)
+    logger.info("%d chunks in total", len(all_chunks))
     return all_chunks
 
 
-# VECTOR STORE
+# Chroma vector store
 def build_vectorstore(
     chunks: List[Document],
     chroma_dir: str  = CHROMA_DIR,
     rebuild: bool    = False,
 ) -> Chroma:
-    """Build or load ChromaDB; auto-recovers from corruption."""
+    # load the Chroma store from disk or build it, rebuilding it when the files are corrupt
     embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
     if rebuild and os.path.exists(chroma_dir):
         logger.info("Removing existing vector store at %s", chroma_dir)
@@ -325,22 +320,22 @@ def build_vectorstore(
         try:
             vs = Chroma(persist_directory=chroma_dir, embedding_function=embeddings)
             count = vs._collection.count()
-            logger.info("Vector store loaded — %d chunks", count)
+            logger.info("Vector store loaded with %d chunks", count)
             return vs
         except Exception as exc:
-            logger.warning("Corrupt store (%s) — rebuilding", exc)
+            logger.warning("Corrupt store (%s), rebuilding", exc)
             shutil.rmtree(chroma_dir)
-    logger.info("Building vector store from %d chunks…", len(chunks))
+    logger.info("Building vector store from %d chunks", len(chunks))
     vs = Chroma.from_documents(
         documents=chunks,
         embedding=embeddings,
         persist_directory=chroma_dir,
     )
-    logger.info("Vector store built — %d chunks indexed", vs._collection.count())
+    logger.info("Vector store built with %d chunks indexed", vs._collection.count())
     return vs
 
 
-# CROSS-ENCODER RERANKER
+# cross-encoder reranker, skipped when sentence-transformers is missing
 _reranker = None
 RERANKER_AVAILABLE = False
 
@@ -348,16 +343,16 @@ def _init_reranker() -> None:
     global _reranker, RERANKER_AVAILABLE
     try:
         from sentence_transformers import CrossEncoder
-        logger.info("Loading cross-encoder reranker…")
+        logger.info("Loading cross-encoder reranker")
         _reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", max_length=512)
         RERANKER_AVAILABLE = True
         logger.info("Cross-encoder reranker ready")
     except Exception as exc:
-        logger.warning("Reranker unavailable (%s) — using ensemble ranking only", exc)
+        logger.warning("Reranker unavailable (%s), using ensemble ranking only", exc)
 
 
 def rerank(query: str, docs: List[Document]) -> List[Document]:
-    """Rerank docs with cross-encoder; fallback to original order."""
+    # sort the documents by cross-encoder score or keep the ensemble order when the reranker is off
     if not RERANKER_AVAILABLE or not docs:
         return docs
     pairs  = [(query, doc.page_content[:512]) for doc in docs]
@@ -366,7 +361,7 @@ def rerank(query: str, docs: List[Document]) -> List[Document]:
 
 
 
-# HYBRID RETRIEVER + DEDUP + SIBLING EXPANSION
+# hybrid retrieval with deduplication and companion Articles
 _all_chunks:  List[Document]    = []
 _vectorstore: Optional[Chroma]  = None
 
@@ -416,13 +411,13 @@ def deduplicate_by_article(
     return result
 
 
-# Regulatory sibling map
+# Articles that need a companion Article to make sense
 _REQUIRED_COMPANIONS: Dict[str, List[str]] = {
-    "NIS2:20": ["NIS2:21"],  # Governance references Risk management measures
-    "NIS2:35": ["NIS2:34"],  # Supervisory measures → General conditions for fines
-    "NIS2:36": ["NIS2:34"],  # Penalties → General conditions for fines
-    "GDPR:38": ["GDPR:37"],  # DPO position → DPO designation
-    "GDPR:39": ["GDPR:37"],  # DPO tasks → DPO designation
+    "NIS2:20": ["NIS2:21"],  # governance refers to the risk management measures
+    "NIS2:35": ["NIS2:34"],  # refers to the general conditions for fines
+    "NIS2:36": ["NIS2:34"],  # penalties rely on the general conditions for fines
+    "GDPR:38": ["GDPR:37"],  # the DPO position depends on the DPO designation
+    "GDPR:39": ["GDPR:37"],  # the DPO tasks depend on the DPO designation
 }
 
 
@@ -450,50 +445,51 @@ def expand_with_companions(
     for key in to_add:
         if key in companion_map:
             result.append(companion_map[key])
-            logger.debug("Companion injected: %s", key)
+            logger.debug("Companion %s added", key)
     return result
 
 
 def retrieve_docs(query: str, regulation_filter: Optional[str] = None) -> List[Document]:
-    """Full retrieval pipeline: ensemble → rerank → dedup → sibling expand."""
+    # ensemble retrieval then rerank then one chunk per Article then companion Articles
     retriever = build_hybrid_retriever(_vectorstore, _all_chunks, regulation_filter)
     raw       = retriever.invoke(query)
     reranked  = rerank(query, raw)
     deduped   = deduplicate_by_article(reranked)
     expanded  = expand_with_companions(deduped, _all_chunks)
-    logger.info("Retrieve: %d raw → %d reranked → %d deduped → %d expanded",
+    logger.info("Retrieved %d raw, %d reranked, %d after dedup, %d after expansion",
                 len(raw), len(reranked), len(deduped), len(expanded))
     return expanded
 
 
 
-# LLM + PROMPTS
+# LLM and prompts
 
 SYSTEM_PROMPT = """You are a senior EU regulatory compliance advisor with deep expertise \
-in cybersecurity law, data protection, and EU legislative frameworks.
+in cybersecurity law, data protection and EU legislative frameworks.
 
-Provide precise, actionable answers strictly grounded in the regulatory context provided.
+Answer only from the regulatory context you receive and keep each answer precise and practical.
 
-Rules:
-1. CITATIONS — Bold all Article references: **Article 23(4) NIS2**. Always include paragraph numbers.
-2. STRUCTURE — Use ## headers for multi-aspect answers. Use bullet points for requirement lists. \
+Follow these rules.
+1. CITATIONS. Bold every Article reference such as **Article 23(4) NIS2** and include paragraph numbers.
+2. STRUCTURE. Use ## headers for multi-aspect answers. Use bullet points for requirement lists. \
 Use > blockquotes for direct quotes from the regulatory text.
-3. CONFIDENCE — End every answer with one of:
-   **Confidence: HIGH** — context fully answers the question.
-   **Confidence: PARTIAL** — context partially answers; state what is missing.
-   **Confidence: LOW** — context insufficient; name Articles likely to contain the answer.
-4. NEVER invent or extrapolate provisions not present in the provided context.
-5. FOLLOW-UPS — After the confidence line, add exactly this HTML comment with 3 concise \
-follow-up questions separated by " | ":
+3. CONFIDENCE. End every answer with one of these lines.
+   **Confidence: HIGH** when the context answers the question in full.
+   **Confidence: PARTIAL** when the context answers only part of the question. State what is missing.
+   **Confidence: LOW** when the context is not enough. Name the Articles likely to contain the answer.
+4. Do not invent or extrapolate provisions that the context does not contain.
+5. FOLLOW-UPS. After the confidence line add exactly this HTML comment with 3 short \
+follow-up questions separated by " | ".
 <!-- SUGGEST: Follow-up question 1? | Follow-up question 2? | Follow-up question 3? -->"""
 
-USER_TEMPLATE = """REGULATORY CONTEXT:
+USER_TEMPLATE = """REGULATORY CONTEXT
 {context}
 {conv_context}
 ---
-COMPLIANCE QUESTION: {question}
+COMPLIANCE QUESTION
+{question}
 
-Provide a precise, well-structured answer citing specific Articles and paragraph numbers."""
+Give a precise and well structured answer that cites the specific Articles and paragraph numbers."""
 
 _llm: Optional[ChatGroq] = None
 
@@ -513,7 +509,7 @@ def _build_context(docs: List[Document]) -> str:
         meta  = doc.metadata
         label = (
             f"[{meta.get('regulation','?')} Article {meta.get('article_num','?')} "
-            f"— {meta.get('article_title','?')}, p.{meta.get('page','?') + 1 if isinstance(meta.get('page'), int) else '?'}]"
+            f"· {meta.get('article_title','?')}, p.{meta.get('page','?') + 1 if isinstance(meta.get('page'), int) else '?'}]"
         )
         parts.append(f"{label}\n{doc.page_content}")
     return "\n\n---\n\n".join(parts)
@@ -535,11 +531,11 @@ def _build_conv_context(chat_history: List[Dict]) -> str:
             i += 1
     if not pairs:
         return ""
-    return "\n\nPREVIOUS CONVERSATION (for context only):\n" + "\n\n".join(pairs)
+    return "\n\nPREVIOUS CONVERSATION, FOR CONTEXT ONLY\n" + "\n\n".join(pairs)
 
 
 def _parse_llm_response(text: str) -> Tuple[str, List[str], str]:
-    # Extract suggestions
+    # pull out the suggested follow-up questions
     suggest_match = SUGGEST_RE.search(text)
     suggestions: List[str] = []
     if suggest_match:
@@ -547,13 +543,13 @@ def _parse_llm_response(text: str) -> Tuple[str, List[str], str]:
         suggestions = [s.strip() for s in raw.split("|") if s.strip()][:3]
         text = text[:suggest_match.start()].rstrip()
 
-    # Extract confidence level
+    # read the confidence level, PARTIAL when the answer has none
     conf_match = CONFIDENCE_RE.search(text)
     confidence = conf_match.group(1).upper() if conf_match else "PARTIAL"
 
     return text.strip(), suggestions, confidence
 
-# STREAMING PIPELINE
+# streaming pipeline that yields the chat state after each step
 _response_times: List[float] = []
 
 
@@ -563,16 +559,16 @@ def stream_pipeline(
     regulation_filter: Optional[str],
 ) -> Generator[Tuple, None, None]:
 
-    # Step 1: show user message immediately
+    # show the user message at once
     history = list(chat_history or [])
     history.append({"role": "user", "content": question})
     yield history, _EMPTY_SOURCES, _EMPTY_SUGGESTIONS, _stats_html()
 
-    # Step 2: retrieve & show sources
+    # retrieve the Articles and show them as sources
     try:
         docs = retrieve_docs(question, regulation_filter)
     except Exception as exc:
-        history.append({"role": "assistant", "content": f"⚠️ Retrieval error: {exc}"})
+        history.append({"role": "assistant", "content": f"Retrieval failed ({exc})"})
         yield history, _EMPTY_SOURCES, _EMPTY_SUGGESTIONS, _stats_html()
         return
 
@@ -580,7 +576,7 @@ def stream_pipeline(
     history.append({"role": "assistant", "content": ""})   # placeholder
     yield history, sources_html, _EMPTY_SUGGESTIONS, _stats_html()
 
-    # Step 3: stream LLM response
+    # stream the LLM answer token by token
     context     = _build_context(docs)
     conv_ctx    = _build_conv_context(history[:-2])  # exclude current exchange
     user_prompt = USER_TEMPLATE.format(
@@ -610,15 +606,15 @@ def stream_pipeline(
             err_str  = str(exc).lower()
             if "429" in err_str or "rate limit" in err_str:
                 wait = 2 ** attempt
-                logger.warning("Rate limited — retry %d/%d after %ds", attempt + 1, LLM_MAX_RETRIES, wait)
+                logger.warning("Rate limited, retry %d/%d after %ds", attempt + 1, LLM_MAX_RETRIES, wait)
                 time.sleep(wait)
             else:
-                accumulated = f"⚠️ **Error**: {exc}"
+                accumulated = f"**Request failed** ({exc})"
                 history[-1] = {"role": "assistant", "content": accumulated}
                 yield list(history), sources_html, _EMPTY_SUGGESTIONS, _stats_html()
                 return
     else:
-        accumulated = f"⚠️ **Rate limit**: API throttled after {LLM_MAX_RETRIES} retries. Wait 30s and try again."
+        accumulated = f"**Rate limit reached** after {LLM_MAX_RETRIES} retries. Wait 30 seconds and try again."
         history[-1] = {"role": "assistant", "content": accumulated}
         yield list(history), sources_html, _EMPTY_SUGGESTIONS, _stats_html()
         return
@@ -628,18 +624,18 @@ def stream_pipeline(
     if len(_response_times) > 20:
         _response_times.pop(0)
 
-    # Step 4: parse answer, show suggestions
+    # strip the tags from the answer and show the follow-up suggestions
     clean_answer, suggestions, confidence = _parse_llm_response(accumulated)
     history[-1] = {"role": "assistant", "content": clean_answer}
     suggestions_html = _build_suggestions_html(suggestions)
     yield list(history), sources_html, suggestions_html, _stats_html()
 
-# EXPORT
+# conversation export as Markdown
 def export_conversation(chat_history: List[Dict]) -> str:
-    """Write conversation to a temp Markdown file and return its path."""
+    # write the conversation to a temporary Markdown file and return its path
     if not chat_history:
         return ""
-    lines = ["# ComplianceIQ — Conversation Export\n"]
+    lines = ["# ComplianceIQ conversation export\n"]
     for msg in chat_history:
         if msg["role"] == "user":
             lines.append(f"## Question\n{msg['content']}\n")
@@ -655,12 +651,12 @@ def export_conversation(chat_history: List[Dict]) -> str:
     return tmp.name
 
 
-# UI HELPERS
+# HTML helpers for the interface
 _EMPTY_SOURCES      = "<p class='empty-state'>Retrieved sources will appear here.</p>"
 _EMPTY_SUGGESTIONS  = ""
 _WELCOME_MSG = (
     "Welcome to **ComplianceIQ**. Ask any compliance question about "
-    "**NIS2** or **GDPR** — I will cite the exact Articles and paragraphs."
+    "**NIS2** or **GDPR** and the answer will cite the exact Articles and paragraphs."
 )
 
 
@@ -693,7 +689,7 @@ def _build_sources_html(docs: List[Document]) -> str:
                 <span class="badge {badge_cls}"><span class="bdot"></span>{reg}{ch_tag}</span>
                 <span class="src-page">p. {page_disp}</span>
             </div>
-            <div class="src-art">Article {art_num} — {art_title}</div>
+            <div class="src-art">Article {art_num} · {art_title}</div>
             <details>
                 <summary>Show excerpt</summary>
                 <p class="src-preview">{preview}</p>
@@ -705,7 +701,7 @@ def _build_sources_html(docs: List[Document]) -> str:
 def _build_suggestions_html(suggestions: List[str]) -> str:
     if not suggestions:
         return _EMPTY_SUGGESTIONS
-    # Use native HTMLTextAreaElement setter so Svelte/Gradio detects the change
+    # use the native HTMLTextAreaElement setter so that Svelte and Gradio see the change
     js = (
         "(function(v){{"
         "var el=document.querySelector('#q-input textarea');"
@@ -718,7 +714,7 @@ def _build_suggestions_html(suggestions: List[str]) -> str:
         "}})({val})"
     )
     items = "".join(
-        f'<button class="sug-btn" onclick="{js.format(val=repr(s))}">💬 {s}</button>'
+        f'<button class="sug-btn" onclick="{js.format(val=repr(s))}">{s}</button>'
         for s in suggestions
     )
     return f'<div class="sug-wrap"><span class="slabel" style="margin-bottom:8px;display:block;">Suggested follow-ups</span>{items}</div>'
@@ -727,10 +723,10 @@ def _build_suggestions_html(suggestions: List[str]) -> str:
 def _stats_html() -> str:
     total   = _vectorstore._collection.count() if _vectorstore else 0
     regs    = sorted({c.metadata.get("regulation", "?") for c in _all_chunks})
-    avg_t   = f"{sum(_response_times)/len(_response_times):.1f}s" if _response_times else "—"
-    reg_str = " · ".join(regs) or "—"
+    avg_t   = f"{sum(_response_times)/len(_response_times):.1f}s" if _response_times else "n/a"
+    reg_str = " · ".join(regs) or "none"
     reranker_badge = (
-        '<span class="stat-badge reranker-on">reranker ✓</span>'
+        '<span class="stat-badge reranker-on">reranker on</span>'
         if RERANKER_AVAILABLE
         else '<span class="stat-badge reranker-off">reranker off</span>'
     )
@@ -744,9 +740,9 @@ def _stats_html() -> str:
         f'</div>'
     )
 
-# CUSTOM CSS 
+# custom dark theme
 CUSTOM_CSS = """
-/* ── CSS variables ─────────────────────────────────────────── */
+/* css variables */
 :root {
     --bg:          #0d1117;
     --surface:     #161b22;
@@ -774,7 +770,7 @@ CUSTOM_CSS = """
     --shadow:      0 4px 20px rgba(0,0,0,.4);
 }
 
-/* ── Base — NO global reset (breaks Gradio/Svelte internals) ── */
+/* base styles without a global reset because it breaks the Gradio and Svelte internals */
 
 body, .gradio-container {
     background: var(--bg) !important;
@@ -784,7 +780,7 @@ body, .gradio-container {
 .gradio-container { max-width: 1200px !important; margin: 0 auto !important; }
 footer { display: none !important; }
 
-/* ── App header ─────────────────────────────────────────────── */
+/* app header */
 #app-header {
     background: linear-gradient(135deg, #0d1117 0%, #161b22 50%, #0d1117 100%);
     border-bottom: 1px solid var(--border);
@@ -821,7 +817,7 @@ footer { display: none !important; }
 .b-llm    { background: var(--purple-dim); border: 1px solid var(--purple-brd); color: var(--purple); }
 .b-ver    { background: var(--gold-dim);   border: 1px solid var(--gold-brd);   color: var(--gold); }
 
-/* ── Stats bar ──────────────────────────────────────────────── */
+/* stats bar */
 #stats-wrap { border-bottom: 1px solid var(--border); padding: 0 36px; }
 .stats-inner {
     display: flex; align-items: center; gap: 20px; padding: 8px 0;
@@ -837,7 +833,7 @@ footer { display: none !important; }
 .reranker-on  { background: var(--green-dim); border: 1px solid var(--green-brd); color: #56d364; }
 .reranker-off { background: rgba(72,79,88,.2); border: 1px solid var(--border2); color: var(--text-dim); }
 
-/* ── Sidebar ────────────────────────────────────────────────── */
+/* sidebar */
 #sidebar {
     background: var(--surface);
     border-right: 1px solid var(--border);
@@ -878,7 +874,7 @@ footer { display: none !important; }
 .hist-btn button:hover { color: var(--text) !important; }
 .hist-btn:last-child button { border-bottom: none !important; }
 
-/* ── Chatbot ─────────────────────────────────────────────────── */
+/* chatbot */
 #chatbot-wrap { padding: 8px 0 0; }
 
 #chatbot .wrap { background: transparent !important; border: none !important; }
@@ -930,7 +926,7 @@ footer { display: none !important; }
 #chatbot .pending { display: none !important; }
 #chatbot .avatar-container img, #chatbot .avatar { border-radius: 50% !important; }
 
-/* ── Input area ──────────────────────────────────────────────── */
+/* input area */
 #input-area {
     padding: 12px 0 16px !important;
     background: var(--bg) !important;
@@ -954,7 +950,7 @@ footer { display: none !important; }
     outline: none !important;
 }
 #q-input textarea::placeholder { color: var(--text-dim) !important; }
-/* NOTE: do NOT hide #q-input label — textarea lives inside it in Gradio 6 */
+/* keep the #q-input label because Gradio 6 puts the textarea inside it */
 #q-input label > span:first-child { display: none !important; } /* hide only the text label */
 #q-input { pointer-events: auto !important; }
 
@@ -997,7 +993,7 @@ footer { display: none !important; }
 }
 .ex-btn button:hover { background: var(--surface2) !important; border-color: var(--blue) !important; color: var(--text) !important; }
 
-/* ── Right panel ──────────────────────────────────────────────── */
+/* right panel */
 #right-panel {
     background: var(--surface) !important;
     border-left: 1px solid var(--border) !important;
@@ -1036,33 +1032,33 @@ details summary:hover { color: var(--text-muted); }
 /* Empty state */
 .empty-state { color: var(--text-dim); font-size: 12px; padding: 6px 0; }
 
-/* ── Footer ───────────────────────────────────────────────────── */
+/* footer */
 #app-footer {
     background: var(--bg); border-top: 1px solid var(--border);
     padding: 10px 36px; text-align: center;
 }
 .foot-txt { color: var(--text-dim); font-size: 11px; }
 
-/* ── Scrollbar ─────────────────────────────────────────────────── */
+/* scrollbar */
 ::-webkit-scrollbar { width: 4px; height: 4px; }
 ::-webkit-scrollbar-track { background: var(--surface); }
 ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
 
-/* ── Responsive ─────────────────────────────────────────────────── */
+/* responsive */
 @media (max-width: 900px) {
     #sidebar, #right-panel { display: none !important; }
     #main-wrap { flex-direction: column; }
 }
 """
 
-# EXAMPLES
+# example questions shown as chips under the chat
 EXAMPLES: List[str] = [
-    "Incident reporting timelines — NIS2",
-    "Right to erasure — GDPR",
+    "NIS2 incident reporting timelines",
+    "GDPR right to erasure",
     "Penalties for NIS2 non-compliance",
     "Role of DPO under GDPR",
-    "Risk management measures — NIS2",
+    "NIS2 risk management measures",
 ]
 EXAMPLE_FULL: List[str] = [
     "What are the incident notification timelines under NIS2?",
@@ -1072,11 +1068,11 @@ EXAMPLE_FULL: List[str] = [
     "What are the cybersecurity risk management measures under NIS2?",
 ]
 
-# BUILD UI
+# Gradio interface
 def build_ui() -> gr.Blocks:
     with gr.Blocks(title="ComplianceIQ") as demo:
 
-        # ── Header ──────────────────────────────────────────────
+        # header
         gr.HTML(f"""
         <div id="app-header">
             <div class="hdr-row">
@@ -1089,7 +1085,7 @@ def build_ui() -> gr.Blocks:
                         </svg>
                         ComplianceIQ
                     </div>
-                    <p class="hdr-sub">AI-powered regulatory advisor · EU cybersecurity &amp; data protection law</p>
+                    <p class="hdr-sub">Regulatory assistant for EU cybersecurity and data protection law</p>
                     <div class="badge-row">
                         <span class="badge b-nis2"><span class="bdot"></span>NIS2 Directive 2022/2555</span>
                         <span class="badge b-gdpr"><span class="bdot"></span>GDPR 2016/679</span>
@@ -1101,13 +1097,13 @@ def build_ui() -> gr.Blocks:
         </div>
         """)
 
-        # Stats bar 
+        # stats bar
         stats_output = gr.HTML(value=_stats_html(), elem_id="stats-wrap")
 
-        # Main layout: sidebar | chat | sources
+        # sidebar on the left, chat in the middle and sources on the right
         with gr.Row(elem_id="main-wrap"):
 
-            # LEFT SIDEBAR
+            # left sidebar
             with gr.Column(elem_id="sidebar", scale=0, min_width=220):
 
                 with gr.Column(elem_classes=["sidebar-section"]):
@@ -1131,14 +1127,14 @@ def build_ui() -> gr.Blocks:
                     <div style="margin-top:auto;">
                         <span class="slabel" style="margin-bottom:6px;">Quick tips</span>
                         <p style="font-size:11px;color:#484f58;line-height:1.6;">
-                            Use <strong style="color:#8b949e;">NIS2</strong> or <strong style="color:#8b949e;">GDPR</strong>
-                            in your question to focus the search.<br><br>
+                            Pick <strong style="color:#8b949e;">NIS2 only</strong> or <strong style="color:#8b949e;">GDPR only</strong>
+                            in the regulation filter to focus the search.<br><br>
                             Press <strong style="color:#8b949e;">Enter</strong> to submit.
                         </p>
                     </div>
                     """)
 
-            # CENTER: CHAT
+            # chat in the middle
             with gr.Column(elem_id="center-area", scale=3):
 
                 with gr.Column(elem_id="chatbot-wrap"):
@@ -1153,10 +1149,10 @@ def build_ui() -> gr.Blocks:
                         buttons=["copy"],
                     )
 
-                # Input area
+                # input area
                 with gr.Column(elem_id="input-area"):
 
-                    # Example chips
+                    # example chips
                     with gr.Row():
                         ex_btns = [
                             gr.Button(ex, size="sm", elem_classes=["ex-btn"])
@@ -1165,20 +1161,20 @@ def build_ui() -> gr.Blocks:
 
                     with gr.Row(equal_height=True):
                         q_input = gr.Textbox(
-                            placeholder="Ask about NIS2 or GDPR compliance…",
+                            placeholder="Ask about NIS2 or GDPR compliance",
                             show_label=False,
                             lines=1,
                             max_lines=4,
                             elem_id="q-input",
                             scale=5,
                         )
-                        submit_btn = gr.Button("Send →", variant="primary", elem_id="submit-btn", scale=1, min_width=90)
+                        submit_btn = gr.Button("Send", variant="primary", elem_id="submit-btn", scale=1, min_width=90)
                         clear_btn  = gr.Button("Clear", elem_id="clear-btn", scale=0, min_width=60)
-                        export_btn = gr.Button("↓ Export", elem_id="export-btn", scale=0, min_width=80)
+                        export_btn = gr.Button("Export", elem_id="export-btn", scale=0, min_width=80)
 
                     export_file = gr.File(visible=False, label="Download")
 
-            # RIGHT PANEL: SOURCES + SUGGESTIONS 
+            # right panel with sources and follow-up suggestions
             with gr.Column(elem_id="right-panel", scale=0, min_width=300):
 
                 gr.HTML('<span class="slabel" style="margin-bottom:8px;display:block;">Sources</span>')
@@ -1186,7 +1182,7 @@ def build_ui() -> gr.Blocks:
 
                 suggestions_output = gr.HTML(value=_EMPTY_SUGGESTIONS)
 
-        # Footer
+        # footer
         gr.HTML("""
         <div id="app-footer">
             <p class="foot-txt">
@@ -1196,10 +1192,10 @@ def build_ui() -> gr.Blocks:
         </div>
         """)
 
-        # State
+        # conversation state
         history_state = gr.State([])
 
-        # Streaming event wiring 
+        # event wiring for the streaming answer
         def _reg_to_filter(reg_radio: str) -> Optional[str]:
             if reg_radio == "NIS2 only":
                 return REG_NIS2
@@ -1213,7 +1209,7 @@ def build_ui() -> gr.Blocks:
             reg_filter = _reg_to_filter(reg)
             for result in stream_pipeline(question, chat_history, reg_filter):
                 ch, src, sug, stats = result
-                # Update history state & buttons
+                # refresh the recent queries and their buttons
                 seen: set = set()
                 new_hist: list = []
                 for m in ch:
@@ -1245,7 +1241,7 @@ def build_ui() -> gr.Blocks:
             outputs=all_outputs,
         )
 
-        # Clear
+        # clear button
         clear_btn.click(
             fn=lambda: (
                 [{"role": "assistant", "content": _WELCOME_MSG}],
@@ -1256,7 +1252,7 @@ def build_ui() -> gr.Blocks:
             outputs=all_outputs,
         )
 
-        # Export
+        # export button
         export_btn.click(
             fn=lambda ch: export_conversation(ch),
             inputs=[chatbot],
@@ -1267,25 +1263,22 @@ def build_ui() -> gr.Blocks:
             outputs=[export_file],
         )
 
-        # Example chips → populate input
+        # an example chip fills the input box
         for btn, full_q in zip(ex_btns, EXAMPLE_FULL):
             btn.click(fn=lambda v=full_q: v, inputs=[], outputs=[q_input])
 
-        # History buttons → re-run query
+        # a recent query button puts its question back in the input box
         for hbtn in hist_btns:
             hbtn.click(fn=lambda v: v, inputs=[hbtn], outputs=[q_input])
 
     return demo
 
-# STARTUP
+# startup
 def startup() -> None:
-    """
-    Initialise all pipeline components.
-    Vector store is rebuilt only if chroma_db is missing or chunk count drifts.
-    """
+    # load the PDFs and build the pipeline, rebuilding the vector store only when it is missing or its chunk count drifts
     global _all_chunks, _vectorstore, _llm
 
-    logger.info("=== ComplianceIQ v%s startup ===", APP_VERSION)
+    logger.info("ComplianceIQ v%s starting", APP_VERSION)
 
     docs_by_file = load_documents()
     _all_chunks  = chunk_documents(docs_by_file)
@@ -1293,22 +1286,22 @@ def startup() -> None:
     needs_rebuild = not os.path.exists(CHROMA_DIR)
     _vectorstore  = build_vectorstore(_all_chunks, rebuild=needs_rebuild)
 
-    # Auto-heal
+    # rebuild the store when its chunk count drifts from the current chunking
     stored  = _vectorstore._collection.count()
     expected = len(_all_chunks)
     if abs(stored - expected) > max(10, expected * 0.05):
-        logger.warning("Chunk count drift (%d stored vs %d expected) — rebuilding", stored, expected)
+        logger.warning("Chunk count drift (%d stored vs %d expected), rebuilding", stored, expected)
         _vectorstore = build_vectorstore(_all_chunks, rebuild=True)
 
     _init_reranker()
     _llm = build_llm()
 
-    logger.info("=== Startup complete — %d chunks, %d regs, reranker=%s ===",
+    logger.info("Startup complete with %d chunks, %d regulations, reranker=%s",
                 len(_all_chunks),
                 len({c.metadata.get("regulation") for c in _all_chunks}),
                 RERANKER_AVAILABLE)
 
-# MAIN
+# run the app locally
 if __name__ == "__main__":
     startup()
     demo = build_ui()
